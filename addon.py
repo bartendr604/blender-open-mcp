@@ -117,8 +117,15 @@ class BlenderMCPServer:
             cmd_type = command.get("type")
             params = command.get("params", {})
             if cmd_type in ["create_object", "modify_object", "delete_object"]:
+                if not bpy.context.screen or not bpy.context.screen.areas:
+                    return {"status": "error", "message": "Suitable 'VIEW_3D' context not found for command execution."}
+
+                view_3d_areas = [area for area in bpy.context.screen.areas if area.type == 'VIEW_3D']
+                if not view_3d_areas:
+                    return {"status": "error", "message": "Suitable 'VIEW_3D' context not found for command execution."}
+
                 override = bpy.context.copy()
-                override['area'] = [area for area in bpy.context.screen.areas if area.type == 'VIEW_3D'][0]
+                override['area'] = view_3d_areas[0]
                 with bpy.context.temp_override(**override):
                     return self._execute_command_internal(command)
             else:

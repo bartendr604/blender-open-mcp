@@ -58,40 +58,76 @@ class BlenderConnection:
     def _receive_full_response(self, buffer_size: int = 8192) -> bytes:
         """Receive data with timeout using a loop."""
         chunks: List[bytes] = []
+        timed_out = False
         try:
             while True:
                 try:
                     chunk = self.sock.recv(buffer_size)
                     if not chunk:
-                       if not chunks:
-                            raise Exception("Connection closed before data")
-                       break
+                        if not chunks:
+                            # Requirement 1b
+                            raise Exception("Connection closed by Blender before any data was sent in this response")
+                        else:
+                            # Requirement 1a
+                            raise Exception("Connection closed by Blender mid-stream with incomplete JSON data")
                     chunks.append(chunk)
                     try:
                         data = b''.join(chunks)
                         json.loads(data.decode('utf-8'))  # Check if it is valid json
                         logger.debug(f"Received response ({len(data)} bytes)")
-                        return data
+                        return data # Complete JSON received
                     except json.JSONDecodeError:
-                        continue # Wait for more JSON data
+                        # Incomplete JSON, continue receiving
+                        continue
                 except socket.timeout:
                     logger.warning("Socket timeout during receive")
+                    timed_out = True # Set flag
                     break # Stop listening to socket
                 except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
                     logger.error(f"Socket connection error: {e!s}")
                     self.sock = None
                     raise # re-raise to outer error handler
-            if chunks: # If chunks exist make them into data to return
+            
+            # This part is reached if loop is broken by 'break' (only timeout case now)
+            if timed_out:
+                if chunks:
+                    data = b''.join(chunks)
+                    # Check if the partial data is valid JSON (it shouldn't be if timeout happened mid-stream)
+                    try:
+                        json.loads(data.decode('utf-8'))
+                        # This case should ideally not be hit if JSON was incomplete,
+                        # but if it's somehow valid, return it.
+                        logger.warning("Timeout occurred, but received data forms valid JSON.")
+                        return data
+                    except json.JSONDecodeError:
+                        # Requirement 2a
+                        raise Exception(f"Incomplete JSON data received before timeout. Received: {data[:200]}")
+                else:
+                    # Requirement 2b
+                    raise Exception("Timeout waiting for response, no data received.")
+            
+            # Fallback if loop exited for a reason not covered by explicit raises inside or by timeout logic
+            # This should ideally not be reached with the current logic.
+            if chunks: # Should have been handled by "Connection closed by Blender mid-stream..."
                 data = b''.join(chunks)
-                logger.debug(f"Returning received data ({len(data)} bytes)")
-                try:
-                    json.loads(data.decode('utf-8'))
-                    return data # return data if valid json
-                except json.JSONDecodeError:
-                    raise Exception("Incomplete JSON")
-            else: raise Exception("No data received") # Raise if no data at all received
-        except socket.timeout: logger.warning("Socket timeout during receive")
-        except Exception as e: logger.error(f"Error during receive: {e!s}"); raise
+                logger.warning(f"Exited receive loop unexpectedly with data: {data[:200]}")
+                raise Exception("Receive loop ended unexpectedly with partial data.")
+            else: # Should have been handled by "Connection closed by Blender before any data..." or timeout
+                logger.warning("Exited receive loop unexpectedly with no data.")
+                raise Exception("Receive loop ended unexpectedly with no data.")
+
+        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+            # This handles connection errors raised from within the loop or if self.sock.recv fails
+            logger.error(f"Connection error during receive: {e!s}")
+            self.sock = None # Ensure socket is reset
+            # Re-raise with a more specific message if needed, or just re-raise
+            raise Exception(f"Connection to Blender lost during receive: {e!s}")
+        except Exception as e: 
+            # Catch other exceptions, including our custom ones, and log them
+            logger.error(f"Error during _receive_full_response: {e!s}")
+            # If it's not one of the specific connection errors, it might be one of our custom messages
+            # or another unexpected issue. Re-raise to be handled by send_command.
+            raise
 
 
     def send_command(self, command_type: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -147,8 +183,12 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         _blender_connection = None
     logger.info("BlenderMCP server shut down")
 
-# Server instance (set up later with command-line arguments)
-mcp = None
+# Initialize MCP server instance globally
+mcp = FastMCP(
+    "BlenderOpenMCP",
+    description="Blender integration with local AI models via Ollama",
+    lifespan=server_lifespan
+)
 
 _blender_connection = None
 _polyhaven_enabled = False
@@ -484,17 +524,11 @@ def main():
     args = parser.parse_args()
 
     # Set global variables from command-line arguments
-    global _ollama_url, _ollama_model, mcp
+    global _ollama_url, _ollama_model
     _ollama_url = args.ollama_url
     _ollama_model = args.ollama_model
 
-    # Now create the MCP server instance
-    mcp = FastMCP(
-        "BlenderOpenMCP",
-        description="Blender integration with local AI models via Ollama",
-        lifespan=server_lifespan
-    )
-
+    # MCP instance is already created globally
     mcp.run(host=args.host, port=args.port)
 
 
